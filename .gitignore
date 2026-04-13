@@ -1,0 +1,42 @@
+# Build and runtime artifacts
+bin/
+obj/
+*.dll
+*.exe
+*.pdb
+*.cache
+
+# IDE
+.vs/
+.vscode/
+*.code-workspace
+*.user
+*.suo
+
+# Dependencies
+node_modules/
+packages/
+
+# Environment & Configuration
+.env
+.env.local
+.env.*.local
+appsettings.Development.json
+appsettings.*.json
+!appsettings.json
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp files
+*.tmp
+*.temp
+~*
+
+# Test results
+TestResults/
