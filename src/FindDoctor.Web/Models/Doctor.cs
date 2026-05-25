@@ -69,6 +69,11 @@ public class DoctorSearchResult
     /// Combined ranking score (relevance + distance)
     /// </summary>
     public double RankingScore { get; set; }
+
+    /// <summary>
+    /// Matched clinical term preference level for this query (higher is preferred)
+    /// </summary>
+    public int ClinicalPreferenceLevel { get; set; }
 }
 
 /// <summary>

@@ -1,455 +1,372 @@
-# FindDoctor AI Assistant - Customer Implementation Guide
+# FindDoctor Implementation Guide
 
-## 1. Executive Summary
+This guide explains how the application works end-to-end, how data flows through the system, and where each responsibility lives in code. It is intended for engineers who want to understand, run, extend, or troubleshoot the project.
 
-This application is an AI-assisted doctor discovery web solution built on Azure services. It enables end users to search healthcare providers using natural language and supports three major query types:
+## 0. Run locally
 
-- Specialty-based search (for example: dermatologist, cardiologist)
-- Condition-based search (for example: acne, brain tumor)
-- Doctor name-based search (for example: Aziza Wahby)
+Prerequisites:
+- .NET SDK 8.x installed.
+- Network access to configured Azure Search/OpenAI/Storage endpoints (or local fallback data for ingestion path).
 
-The solution combines:
+From repository root:
 
-- Azure AI Search for retrieval and ranking
-- Azure Blob Storage for source data ingestion
-- Azure OpenAI (deployed via Azure AI Foundry) for intent extraction
-- ASP.NET Core (Razor Pages + API) as the application host and orchestration layer
+```powershell
+dotnet build .\src\FindDoctor.Web\FindDoctor.Web.csproj
+dotnet run --project .\src\FindDoctor.Web\FindDoctor.Web.csproj
+```
 
-The implementation prioritizes reliability, explainability, and practical production behavior over rigid rule-only matching.
+App URL:
+- http://localhost:5000
 
----
+If port 5000 is already in use:
 
-## 2. Business Goals and Functional Scope
+```powershell
+Get-Process dotnet -ErrorAction SilentlyContinue | Stop-Process -Force
+dotnet run --project .\src\FindDoctor.Web\FindDoctor.Web.csproj
+```
 
-### 2.1 Goals
+## 1. Project overview
 
-- Enable patients to discover relevant providers through conversational search.
-- Reduce dependency on static keyword-only search.
-- Support continuous updates from provider source data in Blob Storage.
-- Keep architecture simple enough for enterprise support and auditability.
+FindDoctor is an ASP.NET Core 8 Razor Pages application that supports natural-language provider search.
 
-### 2.2 Supported User Intents
+Core capabilities:
+- Parse user intent from free-text queries.
+- Search indexed provider data in Azure AI Search.
+- Pre-filter by geolocation radius when location anchor is available.
+- Rank results by relevance and distance.
+- Support location-aware behavior:
+- near me uses browser coordinates.
+- near ZIP/city/address resolves and ranks near that explicit location.
+- Refresh index data from blob storage with local fallback.
 
-- "Find a dermatologist near me"
-- "Doctor for acne treatment"
-- "Aziza Wahby"
-- "Female cardiologist with online scheduling"
+## 2. Runtime architecture
 
-### 2.3 Non-Goals
+Logical components:
+- UI layer: Razor page + browser JavaScript.
+- API layer: minimal endpoints in Program.cs.
+- Orchestration layer: intent extraction and query flow control.
+- Search layer: query composition, tolerant fallback, filtering, ranking.
+- Ingestion layer: JSON parsing and index upsert.
+- Index management layer: schema creation/update.
 
-- Diagnosis or clinical decision support.
-- Medical advice generation.
-- Full referral workflow management.
+External services:
+- Azure AI Search.
+- Azure OpenAI (intent extraction only).
+- Azure Blob Storage.
 
----
+## 3. Code map
 
-## 3. High-Level Architecture
+### Application startup and endpoint wiring
+- [src/FindDoctor.Web/Program.cs](src/FindDoctor.Web/Program.cs)
+- Loads configuration from appsettings and environment variables.
+- Registers Azure/Search/OpenAI/blob clients and app services in DI.
+- Runs startup bootstrap:
+- Ensure index exists.
+- Ingest from blob.
+- Fall back to local file if blob ingestion fails.
+- Exposes endpoints:
+- GET /health
+- POST /api/chat
+- POST /api/ingest
 
-1. User interacts with web chat UI.
-2. UI calls backend endpoint `/api/chat`.
-3. Orchestrator extracts structured filters from natural language.
-4. Search service builds Azure AI Search query and retrieves candidates.
-5. Results are post-processed, ranked, and returned to UI.
-6. On startup (or via API), source doctor data is ingested from Blob Storage into the search index.
+### API and domain models
+- [src/FindDoctor.Web/Models/Doctor.cs](src/FindDoctor.Web/Models/Doctor.cs)
+- Doctor: response model for UI/API.
+- SearchFilters: structured intent extracted from query.
+- DoctorSearchResult: doctor plus relevance/distance/ranking metadata.
+- ChatSearchRequest/ChatSearchResponse: endpoint contracts.
 
-Core application startup, dependency wiring, and endpoints are implemented in:
+### Intent orchestration
+- [src/FindDoctor.Web/Services/AgentOrchestrator.cs](src/FindDoctor.Web/Services/AgentOrchestrator.cs)
+- Main workflow entry: ProcessUserQueryAsync.
+- Extracts filters using OpenAI JSON output.
+- Uses fallback parser if extraction fails.
+- Applies normalization/guardrails.
+- Resolves effective coordinates based on near me vs explicit location.
+- Invokes search service.
+- Formats assistant summary text.
 
-- `src/FindDoctor.Web/Program.cs`
+### Search execution and ranking
+- [src/FindDoctor.Web/Services/AzureSearchService.cs](src/FindDoctor.Web/Services/AzureSearchService.cs)
+- Resolves explicit location text to coordinates from indexed data.
+- Builds strict Lucene query from filters.
+- Builds OData geo filter when coordinates exist:
+- geo.distance(GeoLocation, geography'POINT(lon lat)') le radiusKm
+- Uses default radius 50 miles (80.4672 km) when no explicit radius is provided.
+- Executes semantic-enabled search.
+- Applies condition relevance guard.
+- Retries with tolerant matching when strict query returns zero.
+- Computes distance and ranking score.
+- Sorts and returns top 5:
+- with coordinates: nearest first.
+- without coordinates: UH provider preference then ranking.
 
----
+### Search index schema
+- [src/FindDoctor.Web/Utilities/SearchIndexCreationService.cs](src/FindDoctor.Web/Utilities/SearchIndexCreationService.cs)
+- Idempotent index provisioning at startup.
+- Creates full schema when index is missing.
+- Adds UHProvider and GeoLocation fields if existing index is older.
+- Configures semantic search profile default.
 
-## 4. Azure Services Used
+### Data ingestion
+- [src/FindDoctor.Web/Utilities/DataIngestService.cs](src/FindDoctor.Web/Utilities/DataIngestService.cs)
+- Ingest from blob or local file.
+- Supports two JSON shapes:
+- wrapped object: { "doctors": [...] }
+- direct array: [ ... ]
+- Supports flattened indexing from nested provider-location JSON.
+- Emits one index document per location (Option 1 flattening).
+- Builds stable location-level keys so each provider location can be independently filtered and ranked.
+- Populates GeoLocation for distance filtering.
+- Includes recovery parser for malformed records.
+- Converts source records to index documents.
+- Uploads in batches using MergeOrUpload.
 
-### 4.1 Azure AI Search
+### UI and client request flow
+- [src/FindDoctor.Web/Pages/Index.cshtml](src/FindDoctor.Web/Pages/Index.cshtml)
+- Renders chat UI.
+- Captures optional browser geolocation.
+- Sends POST /api/chat.
+- Renders provider cards with distance when available.
+- [src/FindDoctor.Web/Pages/Index.cshtml.cs](src/FindDoctor.Web/Pages/Index.cshtml.cs)
+- Thin page model with request logging.
 
-Purpose:
+### Build and runtime config
+- [src/FindDoctor.Web/FindDoctor.Web.csproj](src/FindDoctor.Web/FindDoctor.Web.csproj)
+- Package references.
+- Copies local sample data into output on build.
+- [src/FindDoctor.Web/appsettings.json](src/FindDoctor.Web/appsettings.json)
+- Search, OpenAI, and storage settings.
 
-- Primary retrieval layer for provider discovery.
-- Supports searchable fields, filtering, semantic configuration, and ranking.
+## 4. End-to-end execution flow
 
-### 4.2 Azure Blob Storage
+### 4.1 Startup flow
+1. App loads configuration and registers DI services.
+2. Startup scope calls EnsureIndexExistsAsync.
+3. App attempts IngestFromBlobAsync.
+4. If blob ingestion fails, app ingests local sample data.
+5. Web server starts and serves UI/API endpoints.
 
-Purpose:
+### 4.2 Query flow for POST /api/chat
+1. Browser sends query and optional coordinates.
+2. Endpoint forwards request to AgentOrchestrator.
+3. Orchestrator extracts and normalizes filters.
+4. If ambiguous, returns clarification message.
+5. Orchestrator resolves effective location source.
+6. Search service executes strict query.
+7. If needed, search service executes tolerant retry.
+8. Results are ranked/sorted and top 5 returned.
+9. Orchestrator formats summary text and response payload.
+10. UI renders result cards.
 
-- Source-of-truth location for provider data file (`doctors.json`).
-- Ingestion service reads blob and upserts into index.
+## 5. Location behavior
 
-### 4.3 Azure OpenAI (Foundry Deployment)
-
-Purpose:
-
-- Converts free-form user text into structured intent filters.
-
-Runtime model settings are configured in appsettings and include endpoint + deployment name.
-
-### 4.4 ASP.NET Core Application Host
-
-Purpose:
-
-- Hosts UI + API.
-- Coordinates indexing, ingestion, orchestration, and response formatting.
-
----
-
-## 5. Data Ingestion and Indexing Design
-
-Implementation:
-
-- `src/FindDoctor.Web/Utilities/DataIngestService.cs`
-- `src/FindDoctor.Web/Utilities/SearchIndexCreationService.cs`
-
-### 5.1 Index Lifecycle Strategy
-
-- On startup, the app checks whether the index exists.
-- If missing, it creates the index with predefined schema and semantic configuration.
-- If present, it reuses existing index.
-
-This behavior makes environment startup deterministic and reduces manual provisioning steps.
-
-### 5.2 Index Schema Choices
-
-Key schema decisions:
-
-- `DoctorId` is configured as key field.
-- Name fields (`FirstName`, `LastName`) are searchable and sortable.
-- Clinical fields (`ClinicalTerms`, `ClinicalAliases`) are searchable.
-- Location and scheduling fields are filterable (`City`, `State`, `OffersOnlineScheduling`, `Latitude`, `Longitude`).
-- `Languages` is indexed as a searchable collection.
-
-Semantic configuration:
-
-- Title field: specialty
-- Content fields: specialties + clinical terms
-- Keywords fields: aliases + office location
-
-This supports both lexical and semantic relevance.
-
-### 5.3 Source JSON Normalization
-
-The ingestion pipeline handles real-world JSON variability:
-
-- Supports direct JSON array source format.
-- Includes fallback line-by-line parsing to recover records when individual records are malformed.
-- Uses custom converter for list fields to handle:
-  - null values
-  - arrays
-  - pipe-delimited strings
-
-This was critical because production-like data contained mixed list representations.
-
-### 5.4 Upsert Strategy
-
-- Uses `MergeOrUpload` in batches of 100 documents.
-- Logs per-batch success and failures.
-- Enables incremental refresh behavior without full reindex requirement.
+Decision rules:
+- Query contains near me/nearby/around me:
+- use browser coordinates.
+- Query contains explicit ZIP/city/address:
+- resolve coordinates from indexed provider locations.
+- Explicit location cannot be resolved:
+- do not silently fall back to browser location.
 
 Why this matters:
+- It avoids misleading distance output when the user explicitly requested a different location anchor.
 
-- Reduces operational disruption for repeated syncs.
-- Supports evolving provider data with idempotent behavior.
+Radius behavior:
+- When a location anchor exists (near me or explicit location), search is constrained to a 50-mile radius before ranking.
+- If no providers are found within the radius, response message is:
+- No provider available near you. Modify the search and search again.
 
----
+## 6. Ranking and sorting behavior
 
-## 6. Query and Retrieval Design
+If coordinates are available:
+- Search results are already constrained to providers within 50 miles.
+- Primary sort: matched clinical-term preference level descending.
+- Secondary sort: distance ascending.
+- Tertiary sort: ranking score descending.
+- Result size: top 5.
 
-Implementation:
+If coordinates are unavailable:
+- Primary sort: UH provider preference.
+- Secondary sort: matched clinical-term preference level descending.
+- Tertiary sort: ranking score descending.
+- Result size: top 5.
 
-- `src/FindDoctor.Web/Services/AzureSearchService.cs`
+Ranking score:
+- normalizedRelevance = min(rawScore / 4.0, 1.0)
+- distanceScore = max(0, 1 - distanceMiles / 50)
+- baseCombinedRanking = 0.7 * normalizedRelevance + 0.3 * distanceScore
+- matchedClinicalPreferenceLevel is derived from `ClinicalPreferenceMap` for the matched condition terms/aliases.
+- preferenceBoost = min(matchedClinicalPreferenceLevel, 10) / 10.0
+- combinedRanking = baseCombinedRanking + preferenceBoost
 
-### 6.1 Query Construction
+Clinical preference mapping behavior:
+- Ingestion accepts both legacy `ClinicalTerms` string arrays and object-based terms with aliases and `PreferenceLevel`.
+- Each provider document stores a normalized `ClinicalPreferenceMap` containing term/alias to highest preference level.
+- Query-time matching computes the highest matching preference level and uses it in sorting and score boost.
 
-Query generation combines available filters:
+## 7. Index schema design notes
 
-- Doctor name search against `FirstName` and `LastName`
-- Specialty search against `Specialty` and `SpecialtiesCombined`
-- Condition search against `ClinicalTerms` and `ClinicalAliases`
-- Optional filter clauses (gender, online scheduling)
+SearchableField is used for free-text matching:
+- FirstName, LastName, Specialty, SpecialtiesCombined, ClinicalTerms, ClinicalAliases, OfficeLocationName, City, Zip, Languages.
 
-### 6.2 Typo and Variant Tolerance
+SimpleField is used for exact semantics:
+- DoctorId, ProviderType, UHProvider, Gender, State, Phone, OffersOnlineScheduling, Latitude, Longitude.
 
-Without requiring synonym maps, tolerant fallback is implemented using:
+Filterable fields support deterministic constraints:
+- UHProvider, Gender, City, State, Zip, OffersOnlineScheduling, Latitude, Longitude, GeoLocation, and key fields.
 
-- Fuzzy operator (`~`)
-- Prefix wildcard matching (`*`)
-- Lightweight token stemming
+Sortable fields are limited to stable string fields:
+- FirstName and LastName.
 
-If strict query returns no results, system retries with tolerant query.
+Semantic search profile default:
+- Title: Specialty.
+- Content: SpecialtiesCombined, ClinicalTerms.
+- Keywords: ClinicalAliases, OfficeLocationName.
 
-### 6.3 Condition Relevance Guardrails
+## 8. API contracts
 
-Condition-only queries apply additional post-filter checks to prevent clinically irrelevant matches:
+### POST /api/chat
+Request:
+- query: string
+- userLatitude: number|null
+- userLongitude: number|null
 
-- Phrase match preference
-- Token-level whole-word constraints on clinical fields
+Response:
+- userQueryResponse: string
+- results: DoctorSearchResult[]
+- clarifyingQuestion: string
+- requiresClarification: boolean
 
-This avoids broad false positives from noisy term overlap.
+### POST /api/ingest
+Request:
+- blobFileName: string
 
-### 6.4 Name Search Support
+Response:
+- success: boolean
+- message: string
 
-Doctor name support is first-class:
+### GET /health
+Response:
+- status payload indicating service health.
 
-- Exact or near name token matching for first/last names
-- Works with full names and partial tokens
+## 9. Pseudocode
 
-### 6.5 Ranking
+### 9.1 Orchestration
 
-Final ranking combines:
+```text
+function ProcessUserQuery(query, userLat, userLon):
+    filters = ExtractWithOpenAI(query) or BuildFallbackFilters(query)
+    filters = NormalizeFilters(query, filters)
 
-- Search relevance score
-- Optional location proximity score when user coordinates are available
+    if filters.SearchIsAmbiguous:
+        return ClarificationResponse(filters)
 
-Result set is normalized and trimmed to top results for UI presentation.
+    (effectiveLat, effectiveLon) = ResolveEffectiveCoordinates(
+        query, filters, userLat, userLon)
 
----
+    results = HybridSearch(filters, query, effectiveLat, effectiveLon)
 
-## 7. Orchestration and Intent Extraction
+    return BuildChatResponse(results, filters)
+```
 
-Implementation:
+### 9.2 Effective coordinates
 
-- `src/FindDoctor.Web/Services/AgentOrchestrator.cs`
+```text
+function ResolveEffectiveCoordinates(query, filters, browserLat, browserLon):
+    nearMe = IsNearMeQuery(query, filters.Location)
+    explicitLocation = TryExtractExplicitLocation(query, filters.Location)
 
-### 7.1 Role of Orchestrator
+    if nearMe and browser coordinates exist:
+        return browser coordinates
 
-The orchestrator is the conversational control layer:
+    if explicitLocation exists:
+        resolved = ResolveCoordinatesFromLocation(explicitLocation)
+        if resolved exists:
+            update filters with resolved label and coordinates
+            return resolved coordinates
+        else:
+            return (null, null)
 
-1. Extracts structured intent from user text.
-2. Normalizes intent to avoid over-inference errors.
-3. Executes retrieval through search service.
-4. Formats user-friendly response text and cards.
+    return browser coordinates
+```
 
-### 7.2 Extracted Intent Schema
+### 9.3 Hybrid search
 
-Current extraction schema includes:
+```text
+function HybridSearch(filters, query, lat, lon):
+    options = BuildSearchOptions(filters, lat, lon, radiusMiles=50)
 
-- `doctorName`
-- `specialty`
-- `condition`
-- `location`
-- `gender`
-- `onlineScheduling`
-- `isAmbiguous`
+    strictQuery = BuildSearchQuery(filters, tolerant=false)
+    results = Execute(strictQuery, options)
+    results = ApplyConditionGuard(results, filters)
 
-### 7.3 Reliability Behavior
+    if results empty and strictQuery != "*":
+        tolerantQuery = BuildSearchQuery(filters, tolerant=true)
+        results = Execute(tolerantQuery, options)
+        results = ApplyConditionGuard(results, filters)
 
-- If OpenAI extraction fails, fallback parsing path is used.
-- Current fallback is deliberately minimal and generic (no hardcoded specialty map), per test preference.
-- Clarifying questions are generated only when intent is truly ambiguous.
+    for each result:
+        result.DistanceMiles = CalculateDistance(lat, lon, docLat, docLon)
+        result.RankingScore = CalculateRankingScore(relevance, distance)
 
-### 7.4 Anti-Hallucination/Over-Inference Controls
+    if coordinates exist:
+        sort by distance asc, ranking desc
+    else:
+        sort by UHProvider desc, ranking desc
 
-Normalization logic prevents unsupported specialty assumptions:
+    return top 5
+```
 
-- Specialty is trusted only when query context supports it.
-- Condition-driven queries are preserved as condition queries when specialty confidence is low.
+### 9.4 Ingestion
 
-This was introduced to prevent incorrect mapping (for example: unrelated conditions surfacing dermatology-only results).
+```text
+function IngestJson(json):
+    doctors = ParseWrappedOrArray(json)
+    if parse fails:
+        doctors = RecoverByLineParsing(json)
 
----
+    if doctors empty:
+        throw
 
-## 8. User Interface and API Surface
+    // Flatten nested source into one searchable document per location.
+    flattenedDocs = FlattenToLocationDocuments(doctors)
 
-### 8.1 Web UI
+    for batch in flattenedDocs.chunk(100):
+        docs = ConvertToSearchDocuments(batch)
+        IndexDocuments.MergeOrUpload(docs)
+```
 
-Implementation:
+## 10. Troubleshooting map
 
-- `src/FindDoctor.Web/Pages/Index.cshtml`
+Intent extraction issues:
+- [src/FindDoctor.Web/Services/AgentOrchestrator.cs](src/FindDoctor.Web/Services/AgentOrchestrator.cs)
+- ExtractSearchFiltersAsync, NormalizeFilters.
 
-Features:
+Location resolution issues:
+- [src/FindDoctor.Web/Services/AgentOrchestrator.cs](src/FindDoctor.Web/Services/AgentOrchestrator.cs)
+- ResolveEffectiveCoordinatesAsync.
+- [src/FindDoctor.Web/Services/AzureSearchService.cs](src/FindDoctor.Web/Services/AzureSearchService.cs)
+- ResolveCoordinatesFromLocationAsync.
 
-- Chat-style interaction
-- Async request/response rendering
-- Doctor result cards
-- Optional geolocation capture for proximity ranking
+Ranking/sorting issues:
+- [src/FindDoctor.Web/Services/AzureSearchService.cs](src/FindDoctor.Web/Services/AzureSearchService.cs)
+- HybridSearchAsync, CalculateRankingScore, CalculateDistance.
 
-### 8.2 API Endpoints
+Ingestion/index refresh issues:
+- [src/FindDoctor.Web/Utilities/DataIngestService.cs](src/FindDoctor.Web/Utilities/DataIngestService.cs)
+- [src/FindDoctor.Web/Program.cs](src/FindDoctor.Web/Program.cs)
 
-Defined in:
+Schema mismatch issues:
+- [src/FindDoctor.Web/Utilities/SearchIndexCreationService.cs](src/FindDoctor.Web/Utilities/SearchIndexCreationService.cs)
 
-- `src/FindDoctor.Web/Program.cs`
+UI request payload issues:
+- [src/FindDoctor.Web/Pages/Index.cshtml](src/FindDoctor.Web/Pages/Index.cshtml)
 
-Endpoints:
+## 11. Operational notes
 
-- `POST /api/chat` - natural language query endpoint
-- `POST /api/ingest` - explicit data ingestion trigger
-- `GET /health` - health status
-
----
-
-## 9. Security and Identity Considerations
-
-### 9.1 Authentication Model
-
-- Managed identity-style credential flow (`DefaultAzureCredential`) is used for runtime Azure service auth where applicable.
-- Search indexing operations use admin-key client credential in current implementation.
-
-### 9.2 Data and Secret Handling Recommendations
-
-For production hardening:
-
-- Move all secrets to Key Vault.
-- Remove direct secrets from application settings.
-- Apply least-privilege RBAC for search and storage operations.
-- Restrict CORS policy from `AllowAll` to approved origins.
-
-### 9.3 Customer Environment Configuration (Required)
-
-Before running this solution in your own environment, update the placeholders in:
-
-- `src/FindDoctor.Web/appsettings.json`
-
-Required values and where they are used:
-
-1. `Azure:Search:Endpoint`
-- Example format: `https://<your-search-service>.search.windows.net`
-- Used by: `SearchClient` and `SearchIndexClient` in `src/FindDoctor.Web/Program.cs`
-
-2. `Azure:Search:AdminKey`
-- Value: Azure AI Search admin key for your search service
-- Used by: indexing and query clients in `src/FindDoctor.Web/Program.cs`
-
-3. `Azure:Search:IndexName`
-- Value: index name to use (default `doctors`)
-- Used by: search client routing and startup index creation
-
-4. `Azure:OpenAI:Endpoint`
-- Example format: `https://<your-aoai-or-foundry-resource>.cognitiveservices.azure.com`
-- Used by: `AzureOpenAIClient` initialization in `src/FindDoctor.Web/Program.cs`
-
-5. `Azure:OpenAI:ModelDeploymentName`
-- Value: deployment name in your Azure OpenAI / Foundry resource (for example `gpt-4.1`)
-- Used by: intent extraction in `src/FindDoctor.Web/Services/AgentOrchestrator.cs`
-
-6. `Azure:Storage:ConnectionString`
-- Value: storage account connection string for the account holding provider data
-- Used by: blob client creation in `src/FindDoctor.Web/Program.cs`
-
-7. `Azure:Storage:ContainerName`
-- Value: blob container containing doctor source JSON
-- Used by: ingestion service startup flow and `/api/ingest`
-
-8. `Azure:Storage:BlobName`
-- Value: doctor source filename (for example `doctors.json`)
-- Used by: startup sync and manual ingestion endpoint
-
-Recommended secure alternatives:
-
-- Store `AdminKey` and `ConnectionString` in Azure Key Vault.
-- Use environment variables for deployment environments and keep `appsettings.json` placeholder-only.
-
-Suggested environment variable mappings:
-
-- `Azure__Search__Endpoint`
-- `Azure__Search__AdminKey`
-- `Azure__Search__IndexName`
-- `Azure__OpenAI__Endpoint`
-- `Azure__OpenAI__ModelDeploymentName`
-- `Azure__Storage__ConnectionString`
-- `Azure__Storage__ContainerName`
-- `Azure__Storage__BlobName`
-
-Validation checklist before sharing to production users:
-
-- App starts and `/health` returns `healthy`
-- Startup logs show successful index check/creation
-- Startup logs show data sync completion
-- `/api/chat` returns results for at least one specialty query and one name query
-
----
-
-## 10. Operational Runbook
-
-### 10.1 Startup Behavior
-
-On startup:
-
-1. Ensure index exists.
-2. Sync data from blob to index.
-3. Start UI/API host.
-
-### 10.2 Manual Re-Ingestion
-
-Use `POST /api/ingest` with blob filename to force refresh.
-
-### 10.3 Monitoring Signals
-
-Track:
-
-- Ingestion batch success/failure counts
-- Search query text and result counts
-- OpenAI extraction responses/errors
-- API latency and 5xx rates
-
-### 10.4 Known Data/Schema Caveats Encountered
-
-- Source JSON used PascalCase properties.
-- Some list fields were pipe-delimited strings, not arrays.
-- Some boolean fields were nullable.
-
-The current ingestion logic explicitly handles all of the above.
-
----
-
-## 11. Validation Scenarios Executed
-
-Representative tested scenarios:
-
-- Specialty query: `dermatologist` -> returns dermatology providers.
-- Condition query: `brain tumor doctor` -> no irrelevant dermatology false positives.
-- Name query: `Aziza Wahby` -> returns direct provider match.
-
-These tests validated intent extraction, query generation, relevance guardrails, and response formatting.
-
----
-
-## 12. Design Decisions and Rationale
-
-### Decision: Keep retrieval deterministic and auditable
-
-Rationale:
-
-- Search query construction remains explicit and inspectable.
-- AI is used for intent extraction, not direct answer generation over uncontrolled context.
-
-### Decision: Use incremental upsert ingestion
-
-Rationale:
-
-- Supports repeatable sync operations.
-- Avoids expensive and risky full reindex cycles for small updates.
-
-### Decision: Add tolerant lexical fallback instead of large synonym maps
-
-Rationale:
-
-- Avoids unbounded synonym maintenance burden.
-- Handles spelling variants and minor query noise with lower operational overhead.
-
-### Decision: Add post-retrieval condition relevance filtering
-
-Rationale:
-
-- Prevents clinical false positives when condition terms are broad/noisy.
-
----
-
-## 13. Future Enhancement Recommendations
-
-1. Introduce specialty taxonomy service (externalized, versioned) if business requires strict specialty governance.
-2. Add location-aware filtering/radius constraints at query level (not only ranking).
-3. Add conversation memory for follow-up queries (for example: "same doctor but near Cleveland").
-4. Add confidence scores and "why this result" explanations for trust.
-5. Integrate Application Insights dashboards for ingestion/query quality KPIs.
-6. Add automated regression tests for intent extraction and retrieval scenarios.
-
----
-
-## 14. Hand-off Summary for Customer Teams
-
-The application is production-capable as a reference implementation and demonstrates:
-
-- Robust Azure AI Search indexing and retrieval pipeline
-- Real-world JSON ingestion resilience
-- AI-assisted intent extraction with deterministic retrieval controls
-- Flexible support for specialty, condition, and doctor-name search modes
-
-This design provides a strong foundation for enterprise-scale provider search solutions and can be adapted to additional specialties, geographies, and clinical taxonomies.
+- Move secrets out of appsettings for production deployments.
+- Local blob authorization failures are expected without proper identity/RBAC; fallback ingestion keeps the app functional.
+- Semantic configuration name in search options must match the index definition default.
+- Keep local sample data copied to output for fallback ingestion reliability.
+- If migrating from pre-flattening data to location-level flattened keys/GeoLocation, run a one-time index rebuild to avoid stale legacy documents.

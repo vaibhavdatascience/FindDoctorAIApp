@@ -1,3 +1,6 @@
+# Local secrets — never commit real credentials
+src/FindDoctor.Web/appsettings.json
+
 # Build and runtime artifacts
 bin/
 obj/

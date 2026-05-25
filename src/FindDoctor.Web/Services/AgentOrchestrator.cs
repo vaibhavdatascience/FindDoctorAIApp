@@ -86,7 +86,10 @@ public class AgentOrchestrator
             var response = new ChatSearchResponse
             {
                 Results = results,
-                UserQueryResponse = FormatResultsMessage(results, filters),
+                UserQueryResponse = FormatResultsMessage(
+                    results,
+                    filters,
+                    effectiveLatitude.HasValue && effectiveLongitude.HasValue),
                 RequiresClarification = false
             };
             
@@ -356,10 +359,18 @@ Examples:
     /// <summary>
     /// Format search results into a natural, conversational response
     /// </summary>
-    private string FormatResultsMessage(List<DoctorSearchResult> results, SearchFilters filters)
+    private string FormatResultsMessage(
+        List<DoctorSearchResult> results,
+        SearchFilters filters,
+        bool hasLocationAnchor)
     {
         if (results.Count == 0)
         {
+            if (hasLocationAnchor)
+            {
+                return "No provider available near you. Modify the search and search again.";
+            }
+
             return $"I couldn't find doctors matching your criteria. Try adjusting your search or location.";
         }
 
