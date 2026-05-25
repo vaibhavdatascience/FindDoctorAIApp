@@ -89,7 +89,7 @@ public class AgentOrchestrator
                 UserQueryResponse = FormatResultsMessage(
                     results,
                     filters,
-                    effectiveLatitude.HasValue && effectiveLongitude.HasValue),
+                    userLatitude.HasValue && userLongitude.HasValue),
                 RequiresClarification = false
             };
             

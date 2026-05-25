@@ -10,6 +10,7 @@ public class Doctor
     public string LastName { get; set; } = string.Empty;
     public string Specialty { get; set; } = string.Empty;
     public string ProviderType { get; set; } = string.Empty;
+    public string UHProvider { get; set; } = "No";
     public string Gender { get; set; } = string.Empty;
     public List<string> Languages { get; set; } = new();
     public string OfficeLocationName { get; set; } = string.Empty;
